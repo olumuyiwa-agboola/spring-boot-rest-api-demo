@@ -5,6 +5,9 @@ on:
     branches: [ master ]
     paths-ignore:
       - '**/README.md'
+  pull_request:
+    branches: [ master ]
+    types: [ closed ]
   workflow_dispatch:
 
 env:
@@ -13,6 +16,10 @@ env:
 
 jobs:
   Build-and-Push-Docker-Image:
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+
     runs-on: ubuntu-latest
 
     permissions:
@@ -23,20 +30,72 @@ jobs:
       artifact-metadata: write
 
     steps:
+      - name: Clone Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check pom.xml for Version Increment
+        id: version_check
+        run: |
+          CURRENT=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout)
+          git show HEAD~1:pom.xml > /tmp/pom-previous.xml
+          PREVIOUS=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout -f /tmp/pom-previous.xml)
+          
+          echo "Current version: $CURRENT"
+          echo "Previous version: $PREVIOUS"
+          
+          CURRENT_CLEAN=${CURRENT/-SNAPSHOT/}
+          PREVIOUS_CLEAN=${PREVIOUS/-SNAPSHOT/}
+          
+          IFS='.' read -r CURR_MAJOR CURR_MINOR CURR_PATCH <<< "$CURRENT_CLEAN"
+          IFS='.' read -r PREV_MAJOR PREV_MINOR PREV_PATCH <<< "$PREVIOUS_CLEAN"
+          
+          IS_INCREASED=false
+          if [ "$CURR_MAJOR" -gt "$PREV_MAJOR" ]; then
+            IS_INCREASED=true
+          elif [ "$CURR_MAJOR" -eq "$PREV_MAJOR" ] && [ "$CURR_MINOR" -gt "$PREV_MINOR" ]; then
+            IS_INCREASED=true
+          elif [ "$CURR_MAJOR" -eq "$PREV_MAJOR" ] && [ "$CURR_MINOR" -eq "$PREV_MINOR" ] && [ "$CURR_PATCH" -gt "$PREV_PATCH" ]; then
+            IS_INCREASED=true
+          fi
+          
+          if [ "$IS_INCREASED" = "true" ]; then
+            echo "CHANGED=true" >> $GITHUB_OUTPUT
+            echo "VERSION=$CURRENT_CLEAN" >> $GITHUB_OUTPUT
+          else
+            echo "CHANGED=false" >> $GITHUB_OUTPUT
+            if [ "$CURRENT_CLEAN" = "$PREVIOUS_CLEAN" ]; then
+              echo "Version unchanged ($CURRENT_CLEAN) — skipping image build."
+            else
+              echo "::warning::Version decreased or is invalid ($PREVIOUS_CLEAN → $CURRENT_CLEAN) — skipping image build."
+            fi
+          fi
+
+      - name: Skip Build If No Version Change
+        if: steps.version_check.outputs.CHANGED == 'false'
+        run: echo "pom.xml version unchanged — skipping image build."
+
       - name: Login to GitHub Container Registry
+        if: steps.version_check.outputs.CHANGED == 'true'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Metadata (Tags, Labels, etc.) for Docker
+      - name: Extract Metadata (Tags and Labels) for Docker
+        if: steps.version_check.outputs.CHANGED == 'true'
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.VERSION }}
+            type=raw,value=latest
 
-      - name: Build and push
+      - name: Build and Push
+        if: steps.version_check.outputs.CHANGED == 'true'
         id: push
         uses: docker/build-push-action@v7
         with:
@@ -45,6 +104,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Generate Artifact Attestation
+        if: steps.version_check.outputs.CHANGED == 'true'
         uses: actions/attest@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
