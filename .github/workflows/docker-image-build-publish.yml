@@ -91,7 +91,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.VERSION }}
+            type=raw,value=${{ steps.version_check.outputs.VERSION }}
             type=raw,value=latest
 
       - name: Build and Push
